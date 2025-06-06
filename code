@@ -1,0 +1,396 @@
+import tensorflow as tf
+from tensorflow.keras import layers, models, datasets
+import numpy as np
+import streamlit as st
+import matplotlib.pyplot as plt
+from PIL import Image
+import os
+from skimage.metrics import mean_squared_error
+import hashlib
+import json
+import sqlite3
+import io
+import base64
+from datetime import datetime
+
+# Set the page configuration with favicon
+def set_page_config():
+    st.set_page_config(
+        page_title="Image Compression",
+        page_icon="🖼️",  # Picture frame emoji as favicon
+    )
+
+# Create database connection and tables
+def init_database():
+    conn = sqlite3.connect('encrypted_images.db')
+    c = conn.cursor()
+    # Create table for images and encryption keys
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS images (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        image_hash TEXT UNIQUE,
+        original_image BLOB,
+        compressed_image BLOB,
+        encryption_key TEXT,
+        name TEXT,
+        timestamp TEXT,
+        compressed_size INTEGER
+    )
+    ''')
+    conn.commit()
+    return conn
+
+# Load and preprocess the CIFAR-10 dataset
+def load_cifar10_subset(num_samples=1000):
+    (x_train, _), (_, _) = datasets.cifar10.load_data()
+    x_train = x_train[:num_samples]  # Select a small subset
+    x_train = tf.cast(x_train, tf.float32) / 255.0  # Normalize pixel values
+    return x_train.numpy()
+
+# Build the Autoencoder model
+def build_autoencoder(input_shape, compressed_size):
+    input_img = layers.Input(shape=input_shape)
+    
+    # Encoding layers
+    encoded = layers.Conv2D(64, (3, 3), activation='relu', padding='same')(input_img)
+    encoded = layers.MaxPooling2D((2, 2), padding='same')(encoded)
+    encoded = layers.Conv2D(32, (3, 3), activation='relu', padding='same')(encoded)
+    encoded = layers.MaxPooling2D((2, 2), padding='same')(encoded)
+    encoded = layers.Conv2D(16, (3, 3), activation='relu', padding='same')(encoded)
+    encoded = layers.MaxPooling2D((2, 2), padding='same')(encoded)
+    
+    # Decoding layers
+    decoded = layers.Conv2D(16, (3, 3), activation='relu', padding='same')(encoded)
+    decoded = layers.UpSampling2D((2, 2))(decoded)
+    decoded = layers.Conv2D(32, (3, 3), activation='relu', padding='same')(decoded)
+    decoded = layers.UpSampling2D((2, 2))(decoded)
+    decoded = layers.Conv2D(64, (3, 3), activation='relu', padding='same')(decoded)
+    decoded = layers.UpSampling2D((2, 2))(decoded)
+    decoded = layers.Conv2D(3, (3, 3), activation='sigmoid', padding='same')(decoded)
+    
+    autoencoder = models.Model(input_img, decoded)
+    autoencoder.compile(optimizer='adam', loss='mean_squared_error')
+    
+    return autoencoder
+
+# Generate a unique encryption key for an image
+def generate_encryption_key(image):
+    # Create a hash of the image data
+    img_hash = hashlib.sha256(image.tobytes()).hexdigest()
+    # Create a more user-friendly encryption key (still secure)
+    encryption_key = hashlib.md5((img_hash + "salt_value").encode()).hexdigest()
+    return encryption_key, img_hash
+
+# Function to visualize the image
+def visualize_image(image):
+    plt.figure(figsize=(3, 3))
+    plt.imshow(image)
+    plt.axis("off")
+    st.pyplot(plt)
+
+# Optimize image for storage with appropriate format and quality based on size
+def optimize_image_for_storage(image, size):
+    img_bytes = io.BytesIO()
+    
+    # Define optimal compression strategy based on image size
+    if size <= 16:
+        # For very small images (thumbnail size), use WebP with high quality
+        # WebP offers better compression than PNG for small images while maintaining quality
+        if image.mode == 'RGBA':
+            image = image.convert('RGBA')
+        else:
+            image = image.convert('RGB')
+        image.save(img_bytes, format='WebP', quality=90)
+    elif size <= 32:
+        # For small images (32x32), use optimized PNG (good for small, simple images)
+        image.save(img_bytes, format='PNG', optimize=True, compress_level=9)
+    elif size <= 64:
+        # For medium-small images (33-64), use WebP with moderate quality
+        if image.mode == 'RGBA':
+            image = image.convert('RGBA')
+        else:
+            image = image.convert('RGB')
+        image.save(img_bytes, format='WebP', quality=85)
+    else:
+        # For larger images (65+), use JPEG with quality that decreases as size increases
+        # Convert to RGB if needed (JPEG doesn't support RGBA)
+        if image.mode == 'RGBA':
+            image = image.convert('RGB')
+        
+        # Scale quality inversely with size for better compression of larger images
+        if size <= 96:
+            quality = 85
+        elif size <= 128:
+            quality = 75
+        else:
+            quality = 70
+            
+        image.save(img_bytes, format='JPEG', quality=quality, optimize=True)
+    
+    img_bytes.seek(0)
+    return img_bytes
+
+# Function to get file format based on size (for display and download purposes)
+def get_file_format_for_size(size):
+    if size <= 16:
+        return "WebP"
+    elif size <= 32:
+        return "PNG"
+    elif size <= 64:
+        return "WebP"
+    else:
+        return "JPEG"
+
+# Save image and key to database
+def save_to_database(conn, img_hash, original_image, compressed_image, encryption_key, name, compressed_size):
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Convert original image to binary format - ensure we save the FULL resolution image
+        original_bytes = io.BytesIO()
+        if isinstance(original_image, np.ndarray):
+            Image.fromarray((original_image * 255).astype('uint8')).save(original_bytes, format='PNG')
+        elif isinstance(original_image, Image.Image):
+            original_image.save(original_bytes, format='PNG')
+        else:
+            raise ValueError("Unsupported image type for original_image")
+        original_bytes = original_bytes.getvalue()
+        
+        # Optimize compressed image based on size
+        if isinstance(compressed_image, Image.Image):
+            compressed_bytes = optimize_image_for_storage(compressed_image, compressed_size).getvalue()
+        elif isinstance(compressed_image, np.ndarray):
+            img = Image.fromarray((compressed_image * 255).astype('uint8'))
+            compressed_bytes = optimize_image_for_storage(img, compressed_size).getvalue()
+        else:
+            raise ValueError("Unsupported image type for compressed_image")
+        
+        # Insert or replace
+        cursor = conn.cursor()
+        cursor.execute('''
+        INSERT OR REPLACE INTO images 
+        (image_hash, original_image, compressed_image, encryption_key, name, timestamp, compressed_size) 
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (img_hash, original_bytes, compressed_bytes, encryption_key, name, timestamp, compressed_size))
+        conn.commit()
+        return cursor.lastrowid
+    except Exception as e:
+        st.error(f"Database error: {str(e)}")
+        return None
+
+# Get image by encryption key only (no hash needed)
+def get_image_by_key(conn, key):
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM images WHERE encryption_key = ?', (key,))
+    result = cursor.fetchone()
+    if result:
+        # Extract data
+        id, img_hash, original_image_bytes, compressed_image_bytes, encryption_key, name, timestamp, compressed_size = result
+        
+        # Convert binary data back to images
+        original_image = Image.open(io.BytesIO(original_image_bytes))
+        compressed_image = Image.open(io.BytesIO(compressed_image_bytes))
+        
+        return {
+            'id': id,
+            'hash': img_hash,
+            'original_image': original_image,
+            'compressed_image': compressed_image,
+            'encryption_key': encryption_key,
+            'name': name,
+            'timestamp': timestamp,
+            'compressed_size': compressed_size
+        }
+    return None
+
+# Main function
+def main():
+    # Set page configuration first
+    set_page_config()
+    
+    # Initialize database
+    conn = init_database()
+    
+    st.title("Image Compression with Encryption Key")
+    
+    # Allow user to select a wider range of compressed image sizes
+    compressed_size = st.slider("Select Compressed Image Size (Pixels)", 
+                              min_value=4, 
+                              max_value=128, 
+                              value=16, 
+                              step=4)
+    
+    input_shape = (32, 32, 3)  # CIFAR-10 default size
+    
+    # Load dataset
+    x_train = load_cifar10_subset()
+    model_path = "autoencoder_model.h5"
+    
+    autoencoder = None
+    if os.path.exists(model_path):
+        autoencoder = tf.keras.models.load_model(model_path)
+    else:
+        autoencoder = build_autoencoder(input_shape, compressed_size)
+        autoencoder.fit(x_train, x_train, epochs=10, batch_size=32, shuffle=True, validation_split=0.1)
+        autoencoder.save(model_path)
+    
+    # Create tabs for different operations
+    tab1, tab2 = st.tabs(["Compress & Encrypt", "Access Original with Key"])
+    
+    with tab1:
+        st.header("Compress an Image and Generate Encryption Key")
+        # Upload image
+        uploaded_file = st.file_uploader("Upload an Image", type=["jpg", "jpeg", "png"], key="compress_upload")
+        
+        if uploaded_file is not None:
+            # Load the original image at full resolution
+            original_image = Image.open(uploaded_file)
+            image_name = uploaded_file.name
+            
+            # Get original file size in KB
+            original_size_bytes = len(uploaded_file.getvalue())
+            original_size_kb = original_size_bytes / 1024
+            
+            # Resize to match CIFAR-10 dimensions for model input
+            image_resized = original_image.resize((32, 32))
+            image_array = np.array(image_resized).astype('float32') / 255.0
+            image_input = np.expand_dims(image_array, axis=0)
+            
+            # Generate encryption key
+            encryption_key, img_hash = generate_encryption_key(image_array)
+            
+            # Create compressed version at user-specified size
+            compressed_image = original_image.resize((compressed_size, compressed_size))
+            
+            # Calculate file size before display
+            compressed_bytes = optimize_image_for_storage(compressed_image, compressed_size).getvalue()
+            compressed_kb = len(compressed_bytes) / 1024
+            file_format = get_file_format_for_size(compressed_size)
+            
+            # Calculate compression ratio
+            compression_ratio = original_size_kb / compressed_kb
+            
+            st.write(f"Compressed Image Size: {compressed_size}x{compressed_size} ({compressed_kb:.2f} KB, {file_format})")
+            st.write(f"Original Size: {original_size_kb:.2f} KB, Compression Ratio: {compression_ratio:.2f}x")
+            
+            # Display original and compressed
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write("Original Image")
+                st.image(original_image, use_container_width=True)
+            
+            with col2:
+                st.write("Compressed Image")
+                st.image(compressed_image, use_container_width=True)
+            
+            # Display encryption key
+            st.write("Your Encryption Key (required to access the original image):")
+            st.code(encryption_key, language="text")
+            
+            # Save to database button
+            if st.button("Save to Database"):
+                try:
+                    # Make sure the connection is valid
+                    if conn is None:
+                        conn = init_database()
+                    
+                    # Save the ORIGINAL full resolution image to the database
+                    image_id = save_to_database(
+                        conn, 
+                        img_hash, 
+                        original_image,  # Store the full original image
+                        compressed_image, 
+                        encryption_key, 
+                        image_name, 
+                        compressed_size
+                    )
+                    
+                    if image_id:
+                        # Only show the encryption key, no need for hash
+                        st.info(f"Remember your encryption key to access the original later: {encryption_key}")
+                        
+                except Exception as e:
+                    st.error(f"Error saving to database: {str(e)}")
+            
+            # Add direct download option for compressed image
+            st.markdown("### Download Options")
+            
+            # Get file extension based on format
+            file_ext = ".jpg" if file_format == "JPEG" else ".webp" if file_format == "WebP" else ".png"
+            
+            # Use optimized image bytes for download
+            st.download_button(
+                f"Download Compressed Image ({compressed_size}x{compressed_size} - {compressed_kb:.2f} KB)", 
+                compressed_bytes, 
+                f"compressed_{compressed_size}x{compressed_size}{file_ext}", 
+                f"image/{file_format.lower()}" if file_format != "WebP" else "image/webp",
+                key="direct_download"
+            )
+    
+    with tab2:
+        st.header("Access Original Image Using Encryption Key")
+        
+        # Only need encryption key input
+        key_input = st.text_input("Enter Encryption Key")
+        
+        if key_input and st.button("Access Original Image"):
+            image_data = get_image_by_key(conn, key_input)
+            
+            if image_data:
+                st.success("Authentication successful! Displaying original image.")
+                
+                # Get compressed size and calculate file size
+                compressed_size = image_data['compressed_size']
+                compressed_img = image_data['compressed_image']
+                compressed_bytes = optimize_image_for_storage(compressed_img, compressed_size).getvalue()
+                compressed_kb = len(compressed_bytes) / 1024
+                file_format = get_file_format_for_size(compressed_size)
+                
+                # Get original size
+                original_bytes_io = io.BytesIO()
+                image_data['original_image'].save(original_bytes_io, format='PNG')
+                original_bytes_io.seek(0)
+                original_kb = len(original_bytes_io.getvalue()) / 1024
+                
+                # Calculate compression ratio
+                compression_ratio = original_kb / compressed_kb
+                
+                st.write(f"Compression Stats: {compressed_size}x{compressed_size} ({compressed_kb:.2f} KB), Compression Ratio: {compression_ratio:.2f}x")
+                
+                # Display compressed and original
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write(f"Compressed Version ({compressed_kb:.2f} KB)")
+                    st.image(compressed_img, use_container_width=True)
+                
+                with col2:
+                    st.write(f"Original Image ({original_kb:.2f} KB)")
+                    st.image(image_data['original_image'], use_container_width=True)
+                
+                # Allow downloading the original image
+                original_bytes_io.seek(0)
+                
+                st.download_button(
+                    f"Download Original Image ({original_kb:.2f} KB)", 
+                    original_bytes_io.getvalue(), 
+                    f"original_{image_data['name']}", 
+                    "image/png"
+                )
+                
+                # Get file extension based on format
+                file_ext = ".jpg" if file_format == "JPEG" else ".webp" if file_format == "WebP" else ".png"
+                
+                # Allow downloading the compressed image with the optimized format
+                st.download_button(
+                    f"Download Compressed Image ({compressed_kb:.2f} KB)", 
+                    compressed_bytes, 
+                    f"compressed_{image_data['name'].split('.')[0]}{file_ext}", 
+                    f"image/{file_format.lower()}" if file_format != "WebP" else "image/webp",
+                    key="download_compressed"
+                )
+            else:
+                st.error("Invalid encryption key. Access denied.")
+
+# Run the app
+if __name__ == '__main__':
+    main()
